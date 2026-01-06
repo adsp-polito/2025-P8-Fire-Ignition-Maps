@@ -1,4 +1,5 @@
 import os
+# TEST COMMENT ADDED
 import re
 from datetime import datetime
 from typing import Tuple, Optional, Dict, List
@@ -585,6 +586,18 @@ class PiedmontDataset(torch.utils.data.Dataset):
         dem = np.nan_to_num(dem, nan=0).astype(np.float32)
         return dem
 
+    def _read_scalar_band(self, path: str) -> np.ndarray:
+        """
+        Read a single-band raster (e.g., ignition map or landcover) and return (H, W) float32.
+
+        Unlike _read_dem and _read_streets, this helper is generic and can be used for any
+        single-band TIFF that should be treated as a continuous or categorical scalar field.
+        """
+        with rasterio.open(path) as src:
+            band = src.read(1)
+        band = np.nan_to_num(band, nan=0.0).astype(np.float32)
+        return band
+
     # -----------------------------
     # Sampling from bins
     # -----------------------------
@@ -612,39 +625,35 @@ class PiedmontDataset(torch.utils.data.Dataset):
         idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Sentinel-only baseline implementation.
+        Multi-modal implementation.
 
-        Still returns the full 7-tensor tuple expected by the training code:
-        (sentinel, landsat, other_data, era5_raster, era5_tabular, landcover, gt_mask)
+        Returns a 7-tuple with tensors for: Sentinel image, Landsat image (with a presence-flag band),
+        other_data (concatenation of DEM, streets and ignition as 3 channels),
+        ERA5 raster (2 channels), ERA5 tabular (1 value), landcover (single channel),
+        and ground-truth burned-area mask.
 
-        - Sentinel image and GTSentinel mask are real.
-        - Landsat, DEM, streets, ERA5, landcover, ignition are zero placeholders.
-        - Global normalization is applied only to Sentinel.
+        Each modality is loaded from the corresponding file in the fire directory if present,
+        resized to `target_size`, converted to tensors, and normalized using global stats.
         """
         fire_dir = self.fire_dirs[idx]
         files = os.listdir(fire_dir)
 
-        # Keep compatibility with existing utils: allow either 'sentinel_path' or 'path'
+        # ----------------------------
+        # Load Sentinel image
+        # ----------------------------
         best_image_info = find_best_image_in_folder(fire_dir)
         if best_image_info is None:
             raise FileNotFoundError(
                 f"No valid Sentinel image found in '{os.path.basename(fire_dir)}'. "
                 f"Cannot load sample index {idx}."
             )
-
-        if "sentinel_path" in best_image_info:
-            sentinel_path = best_image_info["sentinel_path"]
-        elif "path" in best_image_info:
-            sentinel_path = best_image_info["path"]
-        else:
+        sentinel_path = best_image_info.get("sentinel_path") or best_image_info.get("path")
+        if sentinel_path is None:
             raise KeyError(
-                "find_best_image_in_folder must return a dict with key 'sentinel_path' "
-                "or 'path'."
+                "find_best_image_in_folder must return a dict with key 'sentinel_path' or 'path'."
             )
-
         pre_sentinel_np = self._read_image(sentinel_path)
-
-        # Enforce target_size if needed (defensive; if patches are already the right size, this is a no-op)
+        # Ensure target size
         h, w, _ = pre_sentinel_np.shape
         if (h, w) != self.target_size:
             pre_sentinel_np = cv2.resize(
@@ -652,20 +661,129 @@ class PiedmontDataset(torch.utils.data.Dataset):
                 (self.target_size[1], self.target_size[0]),
                 interpolation=cv2.INTER_LINEAR,
             )
-
-        # Zero placeholders for all non-Sentinel data
         H, W = self.target_size
-        landsat_resampled_np = np.zeros((H, W, N_BANDS_LANDSAT_ACTUAL), dtype=np.float32)
-        landsat_presence_flag = np.zeros((H, W, 1), dtype=np.float32)
-        landsat_input_to_aug = np.concatenate([landsat_resampled_np, landsat_presence_flag], axis=2)
 
-        streets_np = np.zeros((H, W, 1), dtype=np.float32)
-        dem_np = np.zeros((H, W, 1), dtype=np.float32)
-        ignition_np = np.zeros((H, W, 1), dtype=np.float32)
-        era5_raster_np = np.zeros((H, W, N_BANDS_ERA5_RASTER), dtype=np.float32)
-        landcover_np = np.zeros((H, W, 1), dtype=np.float32)
+        # ----------------------------
+        # Load Landsat image and presence flag
+        # ----------------------------
+        landsat_np = None
+        for f in files:
+            if ("pre_landsat" in f) and ("_10m.tif" in f) and ("_CM" not in f):
+                landsat_np = self._read_image(os.path.join(fire_dir, f))
+                break
+        if landsat_np is not None:
+            if landsat_np.shape[:2] != (H, W):
+                landsat_np = cv2.resize(
+                    landsat_np, (W, H), interpolation=cv2.INTER_LINEAR
+                )
+            landsat_presence_flag = np.ones((H, W, 1), dtype=np.float32)
+        else:
+            landsat_np = np.zeros((H, W, N_BANDS_LANDSAT_ACTUAL), dtype=np.float32)
+            landsat_presence_flag = np.zeros((H, W, 1), dtype=np.float32)
+        landsat_input_to_aug = np.concatenate([landsat_np, landsat_presence_flag], axis=2)
 
-        # Ground truth mask
+        # ----------------------------
+        # Load DEM (prefer dem_10m.tif, fallback to dem.tif)
+        # ----------------------------
+        dem_np = None
+        for f in files:
+            if ("dem_10m" in f) and f.endswith(".tif"):
+                dem_np = self._read_dem(os.path.join(fire_dir, f))
+                break
+        if dem_np is None:
+            for f in files:
+                if ("dem" in f) and f.endswith(".tif"):
+                    dem_np = self._read_dem(os.path.join(fire_dir, f))
+                    break
+        if dem_np is not None:
+            if dem_np.shape != (H, W):
+                dem_np = cv2.resize(dem_np, (W, H), interpolation=cv2.INTER_LINEAR)
+            dem_np = dem_np[..., np.newaxis].astype(np.float32)
+        else:
+            dem_np = np.zeros((H, W, 1), dtype=np.float32)
+
+        # ----------------------------
+        # Load streets
+        # ----------------------------
+        streets_np = None
+        for f in files:
+            if "streets" in f and f.endswith(".tif"):
+                streets_np = self._read_streets(os.path.join(fire_dir, f))
+                break
+        if streets_np is not None:
+            if streets_np.shape != (H, W):
+                streets_np = cv2.resize(streets_np, (W, H), interpolation=cv2.INTER_LINEAR)
+            streets_np = streets_np[..., np.newaxis].astype(np.float32)
+        else:
+            streets_np = np.zeros((H, W, 1), dtype=np.float32)
+
+        # ----------------------------
+        # Load ignition map (prefer ignition_map.tif, fallback to ignition_pt.tif)
+        # ----------------------------
+        ignition_np = None
+        for f in files:
+            if ("ignition_map" in f) and f.endswith(".tif"):
+                ignition_np = self._read_scalar_band(os.path.join(fire_dir, f))
+                break
+        if ignition_np is None:
+            for f in files:
+                if ("ignition_pt" in f) and f.endswith(".tif"):
+                    ignition_np = self._read_scalar_band(os.path.join(fire_dir, f))
+                    break
+        if ignition_np is not None:
+            if ignition_np.shape != (H, W):
+                ignition_np = cv2.resize(ignition_np, (W, H), interpolation=cv2.INTER_LINEAR)
+            ignition_np = ignition_np[..., np.newaxis].astype(np.float32)
+        else:
+            ignition_np = np.zeros((H, W, 1), dtype=np.float32)
+
+        # ----------------------------
+        # Load ERA5 multi-band file
+        # ----------------------------
+        era5_np = None
+        for f in files:
+            if ("era5" in f) and f.endswith(".tif"):
+                era5_np = self._read_image(os.path.join(fire_dir, f))
+                break
+        if era5_np is not None:
+            if era5_np.shape[:2] != (H, W):
+                era5_np = cv2.resize(era5_np, (W, H), interpolation=cv2.INTER_LINEAR)
+            # Ensure the expected number of bands
+            if era5_np.shape[2] < N_BANDS_ERA5:
+                pad = N_BANDS_ERA5 - era5_np.shape[2]
+                era5_np = np.concatenate(
+                    [era5_np, np.zeros((H, W, pad), dtype=np.float32)], axis=2
+                )
+            # Split raster bands and compute tabular mean
+            era5_raster_np = era5_np[:, :, ERA5_RASTER_BAND_INDICES]
+            era5_tabular_val = float(
+                np.mean(era5_np[:, :, ERA5_TABULAR_BAND_INDICES[0]])
+            )
+        else:
+            era5_raster_np = np.zeros((H, W, N_BANDS_ERA5_RASTER), dtype=np.float32)
+            era5_tabular_val = 0.0
+
+        # ----------------------------
+        # Load landcover
+        # ----------------------------
+        landcover_np = None
+        for f in files:
+            if ("landcover" in f) and f.endswith(".tif"):
+                landcover_np = self._read_scalar_band(os.path.join(fire_dir, f))
+                break
+        if landcover_np is not None:
+            if landcover_np.shape != (H, W):
+                # nearest-neighbour resize for categorical landcover
+                landcover_np = cv2.resize(
+                    landcover_np, (W, H), interpolation=cv2.INTER_NEAREST
+                )
+            landcover_np = landcover_np[..., np.newaxis].astype(np.float32)
+        else:
+            landcover_np = np.zeros((H, W, 1), dtype=np.float32)
+
+        # ----------------------------
+        # Load ground-truth burned area mask
+        # ----------------------------
         gt_mask_path = None
         for f in files:
             if ("GTSentinel" in f) and f.endswith(".tif"):
@@ -673,12 +791,13 @@ class PiedmontDataset(torch.utils.data.Dataset):
                 break
         if gt_mask_path is None:
             raise FileNotFoundError(
-                f"No GTSentinel mask found in {fire_dir} for index {idx}. "
-                "This should not happen after filtering."
+                f"No GTSentinel mask found in {fire_dir} for index {idx}."
             )
         gt_mask_np = self._read_mask(gt_mask_path)
 
-        # Apply augmentations or simple ToTensor
+        # ----------------------------
+        # Apply augmentations or evaluation transforms
+        # ----------------------------
         if self.apply_augmentations:
             transformed = self.augmentor(
                 image=pre_sentinel_np,
@@ -694,40 +813,54 @@ class PiedmontDataset(torch.utils.data.Dataset):
             landsat_image_tensor = transformed["landsat_image"]
             streets_tensor = transformed["streets_image"]
             dem_tensor = transformed["dem_image"]
-            era5_tensor = transformed["era5_image"]
             ignition_tensor = transformed["ignition_pt"]
+            era5_tensor = transformed["era5_image"]
             gt_mask_tensor = transformed["mask"]
             landcover_tensor = transformed["landcover_np"]
         else:
-            ts_sentinel = self.eval_transform(image=pre_sentinel_np, mask=gt_mask_np)
-            sentinel_image_tensor = ts_sentinel["image"]
-            gt_mask_tensor = ts_sentinel["mask"]
-
+            ts = self.eval_transform(image=pre_sentinel_np, mask=gt_mask_np)
+            sentinel_image_tensor = ts["image"]
+            gt_mask_tensor = ts["mask"]
             landsat_image_tensor = self.eval_transform(image=landsat_input_to_aug)["image"]
             streets_tensor = self.eval_transform(image=streets_np)["image"]
             dem_tensor = self.eval_transform(image=dem_np)["image"]
-            era5_tensor = self.eval_transform(image=era5_raster_np)["image"]
             ignition_tensor = self.eval_transform(image=ignition_np)["image"]
+            era5_tensor = self.eval_transform(image=era5_raster_np)["image"]
             landcover_tensor = self.eval_transform(image=landcover_np)["image"]
 
-        # Normalize Sentinel only (baseline)
+        # ----------------------------
+        # Normalize modalities
+        # ----------------------------
         if self.global_stats:
             sentinel_image_tensor = self._normalize_bands_global(
                 sentinel_image_tensor, sensor_type="sentinel"
             )
+            # Landsat: normalize first 15 bands and keep presence flag unchanged
+            landsat_bands = landsat_image_tensor[:N_BANDS_LANDSAT_ACTUAL]
+            landsat_flag = landsat_image_tensor[N_BANDS_LANDSAT_ACTUAL:]
+            landsat_bands = self._normalize_bands_global(
+                landsat_bands, sensor_type="landsat"
+            )
+            landsat_image_tensor = torch.cat([landsat_bands, landsat_flag], dim=0)
+            dem_tensor = self._normalize_dem_global(dem_tensor)
+            era5_tensor = self._normalize_era5_global(era5_tensor)
+            era5_tabular_tensor = self._normalize_era5_tabular(
+                torch.tensor([era5_tabular_val], dtype=torch.float32)
+            )
+        else:
+            era5_tabular_tensor = torch.tensor([era5_tabular_val], dtype=torch.float32)
 
-        # Other data concatenation: DEM + streets
-        other_data_tensor = torch.concat([dem_tensor, streets_tensor], dim=0)
-
-        # ERA5 tabular is zero for now (Sentinel-only baseline)
-        era5_tabular = torch.zeros(N_BANDS_ERA5_TABULAR, dtype=torch.float32)
+        # ----------------------------
+        # Pack other_data tensor (DEM + streets + ignition)
+        # ----------------------------
+        other_data_tensor = torch.cat([dem_tensor, streets_tensor, ignition_tensor], dim=0)
 
         return (
             sentinel_image_tensor,
             landsat_image_tensor,
             other_data_tensor,
             era5_tensor,
-            era5_tabular,
+            era5_tabular_tensor,
             landcover_tensor,
             gt_mask_tensor,
         )

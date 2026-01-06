@@ -2,6 +2,33 @@ import torch
 import numpy as np
 from utils import fast_hist, fire_area_iou  # per_class_iou not needed for this baseline
 
+# ---- Gradient Accumulation Control ----
+ACCUM_STEPS = 8  # effective_batch = BATCH_SIZE * ACCUM_STEPS
+
+
+def dice_loss(logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
+    """
+    Compute the Dice loss for binary segmentation.
+
+    Args:
+        logits: Raw logits from the model of shape (B, 1, H, W).
+        targets: Ground-truth mask of shape (B, 1, H, W) or (B, H, W).
+        smooth: Smoothing constant to avoid division by zero.
+
+    Returns:
+        Scalar Dice loss averaged over the batch.
+    """
+    if targets.dim() == 3:
+        targets = targets.unsqueeze(1)
+    probs = torch.sigmoid(logits)
+    targets = targets.float()
+    probs_flat = probs.view(probs.size(0), -1)
+    targets_flat = targets.view(targets.size(0), -1)
+    intersection = (probs_flat * targets_flat).sum(dim=1)
+    denominator = probs_flat.sum(dim=1) + targets_flat.sum(dim=1)
+    dice = (2 * intersection + smooth) / (denominator + smooth)
+    return 1.0 - dice.mean()
+
 
 def train(
     model,
@@ -16,33 +43,21 @@ def train(
     w_landcover: float,
 ):
     """
-    Training loop for SINGLE-TASK burned-area segmentation.
-
-    Current PiedmontDataset __getitem__ returns:
-        (
-            image_sentinel,   # [B, 12, H, W]
-            image_landsat,    # [B, 16, H, W] (placeholder)
-            other_data,       # [B, 2, H, W]  (DEM + streets, placeholder)
-            era5_raster,      # [B, 2, H, W]  (placeholder)
-            era5_tabular,     # [B, 1]        (placeholder)
-            landcover_input,  # [B, 1, H, W]  (placeholder, NOT GT)
-            gt_mask,          # [B, 1, H, W] OR [B, H, W] depending on path
-        )
-
-    Baseline behavior:
-        - Only burned-area head is trained.
-        - Landcover head is ignored (loss = 0).
-        - Ignition map is synthesized as zeros.
+    Training loop for SINGLE-TASK burned-area segmentation with gradient accumulation.
     """
     model.train()
 
-    # Confusion matrix for burned area (binary)
-    # hist_ba[gt, pred]: rows = GT {0,1}, cols = prediction {0,1}
     hist_ba = np.zeros((2, 2), dtype=np.int64)
 
     total_loss = 0.0
     total_ba_loss = 0.0
-    total_lc_loss = 0.0  # stays 0.0 in this baseline
+    total_lc_loss = 0.0
+
+    printed_device_info = False
+    LOG_EVERY = 50
+
+    # ---- IMPORTANT: with accumulation, call zero_grad() ONCE before loop ----
+    optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, batch in enumerate(dataloader):
         (
@@ -51,29 +66,43 @@ def train(
             other_data,
             era5_raster,
             era5_tabular,
-            landcover_input,  # not used as GT here
+            landcover_input,
             gt_mask,
         ) = batch
 
-        image_sentinel = image_sentinel.to(device)
-        image_landsat = image_landsat.to(device)
-        other_data = other_data.to(device)
-        era5_raster = era5_raster.to(device)
-        era5_tabular = era5_tabular.to(device)
-        landcover_input = landcover_input.to(device)  # unused, but moved for completeness
-        gt_mask = gt_mask.to(device)
+        image_sentinel = image_sentinel.to(device, non_blocking=True)
+        image_landsat = image_landsat.to(device, non_blocking=True)
+        other_data = other_data.to(device, non_blocking=True)
+        era5_raster = era5_raster.to(device, non_blocking=True)
+        era5_tabular = era5_tabular.to(device, non_blocking=True)
+        landcover_input = landcover_input.to(device, non_blocking=True)
+        gt_mask = gt_mask.to(device, non_blocking=True)
 
-        # Ensure mask has shape [B, 1, H, W] for BCEWithLogitsLoss
-        if gt_mask.dim() == 3:  # [B, H, W] -> [B, 1, H, W]
+        if not printed_device_info:
+            try:
+                print(
+                    f"[train][epoch {epoch}] device={device} | "
+                    f"model_param_device={next(model.parameters()).device} | "
+                    f"batch_sentinel_device={image_sentinel.device} | "
+                    f"ACCUM_STEPS={ACCUM_STEPS}"
+                )
+            except StopIteration:
+                print(
+                    f"[train][epoch {epoch}] device={device} | "
+                    f"model has no parameters? (unexpected) | "
+                    f"batch_sentinel_device={image_sentinel.device} | "
+                    f"ACCUM_STEPS={ACCUM_STEPS}"
+                )
+            printed_device_info = True
+
+        # Ensure mask has shape [B, 1, H, W]
+        if gt_mask.dim() == 3:
             gt_mask_ch = gt_mask.unsqueeze(1)
         else:
-            gt_mask_ch = gt_mask  # already [B, 1, H, W]
+            gt_mask_ch = gt_mask
 
-        # Dummy ignition map (all zeros, same spatial shape as mask)
         ignition_pt = torch.zeros_like(gt_mask_ch, device=device)
 
-        # Forward pass through the multimodal model
-        # NOTE: model internally uses only Sentinel in this baseline
         outputs_burned_area, _ = model(
             image_sentinel,
             image_landsat,
@@ -83,43 +112,45 @@ def train(
             era5_tabular,
         )
 
-        # outputs_burned_area is [B, 1, H, W]; match it directly with gt_mask_ch
         logits_ba = outputs_burned_area
 
-        # Burned-area loss
-        loss_burned_area = burned_area_loss_fn(
-            logits_ba,
-            gt_mask_ch.float(),
-        )
+        bce_loss = burned_area_loss_fn(logits_ba, gt_mask_ch.float())
+        dice = dice_loss(logits_ba, gt_mask_ch)
+        loss_burned_area = 0.5 * bce_loss + 0.5 * dice
 
-        # Landcover loss is disabled in this baseline
         loss_landcover = torch.tensor(0.0, device=device)
 
-        # Total loss is effectively just burned-area loss
         loss = w_mask * loss_burned_area + w_landcover * loss_landcover
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # ---- Gradient accumulation: scale loss down ----
+        loss_scaled = loss / ACCUM_STEPS
+        loss_scaled.backward()
+
+        # ---- Step optimizer every ACCUM_STEPS ----
+        is_update_step = ((batch_idx + 1) % ACCUM_STEPS == 0) or ((batch_idx + 1) == len(dataloader))
+        if is_update_step:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        # Telemetry (optional)
+        if device.type == "cuda" and (batch_idx % LOG_EVERY == 0):
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_allocated() / (1024**2)
+            reserved = torch.cuda.memory_reserved() / (1024**2)
+            print(f"[gpu] batch={batch_idx} | allocated={allocated:.1f}MB | reserved={reserved:.1f}MB")
 
         total_loss += float(loss.item())
         total_ba_loss += float(loss_burned_area.item())
         total_lc_loss += float(loss_landcover.item())
 
-        # --- Metrics: burned-area IoU components ---
         with torch.no_grad():
-            # logits_ba: [B, 1, H, W], gt_mask_ch: [B, 1, H, W]
             predicted_ba = (torch.sigmoid(logits_ba) > 0.5).float()
-
             targets_ba_flat = gt_mask_ch.squeeze(1).cpu().numpy().astype(int).flatten()
             predicted_ba_flat = predicted_ba.squeeze(1).cpu().numpy().astype(int).flatten()
-
             hist_ba += fast_hist(targets_ba_flat, predicted_ba_flat, 2)
 
-    # Epoch-level metrics
     iou_ba = fire_area_iou(hist_ba)
 
-    # Derive precision, recall, F1 from confusion matrix
     tn, fp, fn, tp = (
         hist_ba[0, 0],
         hist_ba[0, 1],
@@ -132,9 +163,8 @@ def train(
 
     avg_total_loss = total_loss / max(1, len(dataloader))
     avg_ba_loss = total_ba_loss / max(1, len(dataloader))
-    avg_land_loss = total_lc_loss / max(1, len(dataloader))  # stays 0.0
+    avg_land_loss = total_lc_loss / max(1, len(dataloader))
 
-    # Optional TensorBoard logging
     if writer is not None:
         writer.add_scalar("Loss/total_train", avg_total_loss, epoch)
         writer.add_scalar("Loss/burned_area_train", avg_ba_loss, epoch)
@@ -157,11 +187,7 @@ def val(
     epoch,
 ):
     """
-    Validation loop for SINGLE-TASK burned-area segmentation.
-
-    Same assumptions as in train():
-        - 7-tuple batches from the dataset
-        - Only burned-area head is evaluated
+    Validation loop (no grad accumulation needed).
     """
     model.eval()
 
@@ -169,7 +195,9 @@ def val(
 
     total_loss = 0.0
     loss_ba_sum = 0.0
-    loss_land_sum = 0.0  # stays 0.0
+    loss_land_sum = 0.0
+
+    printed_device_info = False
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
@@ -179,20 +207,34 @@ def val(
                 other_data,
                 era5_raster,
                 era5_tabular,
-                landcover_input,  # not used in baseline
+                landcover_input,
                 gt_mask,
             ) = batch
 
-            image_sentinel = image_sentinel.to(device)
-            image_landsat = image_landsat.to(device)
-            other_data = other_data.to(device)
-            era5_raster = era5_raster.to(device)
-            era5_tabular = era5_tabular.to(device)
-            landcover_input = landcover_input.to(device)
-            gt_mask = gt_mask.to(device)
+            image_sentinel = image_sentinel.to(device, non_blocking=True)
+            image_landsat = image_landsat.to(device, non_blocking=True)
+            other_data = other_data.to(device, non_blocking=True)
+            era5_raster = era5_raster.to(device, non_blocking=True)
+            era5_tabular = era5_tabular.to(device, non_blocking=True)
+            landcover_input = landcover_input.to(device, non_blocking=True)
+            gt_mask = gt_mask.to(device, non_blocking=True)
 
-            # Ensure mask has shape [B, 1, H, W]
-            if gt_mask.dim() == 3:  # [B, H, W]
+            if not printed_device_info:
+                try:
+                    print(
+                        f"[val][epoch {epoch}] device={device} | "
+                        f"model_param_device={next(model.parameters()).device} | "
+                        f"batch_sentinel_device={image_sentinel.device}"
+                    )
+                except StopIteration:
+                    print(
+                        f"[val][epoch {epoch}] device={device} | "
+                        f"model has no parameters? (unexpected) | "
+                        f"batch_sentinel_device={image_sentinel.device}"
+                    )
+                printed_device_info = True
+
+            if gt_mask.dim() == 3:
                 gt_mask_ch = gt_mask.unsqueeze(1)
             else:
                 gt_mask_ch = gt_mask
@@ -210,10 +252,9 @@ def val(
 
             logits_ba = outputs_burned_area
 
-            loss_burned_area = burned_area_loss_fn(
-                logits_ba,
-                gt_mask_ch.float(),
-            )
+            bce_loss = burned_area_loss_fn(logits_ba, gt_mask_ch.float())
+            dice = dice_loss(logits_ba, gt_mask_ch)
+            loss_burned_area = 0.5 * bce_loss + 0.5 * dice
             loss_landcover = torch.tensor(0.0, device=device)
 
             total_batch_loss = loss_burned_area + loss_landcover
@@ -221,7 +262,6 @@ def val(
             loss_ba_sum += float(loss_burned_area.item())
             loss_land_sum += float(loss_landcover.item())
 
-            # Metrics
             predicted_ba = (torch.sigmoid(logits_ba) > 0.5).float()
             targets_ba_flat = gt_mask_ch.squeeze(1).cpu().numpy().astype(int).flatten()
             predicted_ba_flat = predicted_ba.squeeze(1).cpu().numpy().astype(int).flatten()
@@ -241,7 +281,7 @@ def val(
 
     avg_total_loss = total_loss / max(1, len(dataloader))
     avg_ba_loss = loss_ba_sum / max(1, len(dataloader))
-    avg_land_loss = loss_land_sum / max(1, len(dataloader))  # 0.0
+    avg_land_loss = loss_land_sum / max(1, len(dataloader))
 
     if writer is not None:
         writer.add_scalar("Loss/total_val", avg_total_loss, epoch)

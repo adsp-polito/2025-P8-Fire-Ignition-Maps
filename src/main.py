@@ -1,4 +1,3 @@
-
 import os
 import time
 import random
@@ -23,26 +22,30 @@ from train import train, val
 ROOT_DIR = "../data/"  # root directory containing fire_* folders
 GEOJSON_PATH = "../geojson/piedmont_2012_2024_fa.geojson"  # TODO: set this correctly
 
-CHECKPOINT_DIR = "checkpoints"
+CHECKPOINT_DIR = "checkpoint_2"
 LOG_DIR_BASE = "runs"
 
+model_name = "best_model_3.pth"
 
-BATCH_SIZE = 4
-NUM_WORKERS = 4
 
-NUM_EPOCHS = 40 
-LEARNING_RATE_MAIN = 1e-4
-WEIGHT_DECAY = 5e-4
+BATCH_SIZE = 2
+NUM_WORKERS = 8
+
+NUM_EPOCHS = 120
+LEARNING_RATE_MAIN = 3e-4
+WEIGHT_DECAY = 1e-4
 
 W_MASK = 1.0        # weight for burned-area loss
-W_LANDCOVER = 1.0   # weight for landcover loss (unused baseline, kept for API)
+W_LANDCOVER = 0  # weight for landcover loss (unused baseline, kept for API)
 
 TRAIN_SPLIT = 0.8   # 80% train / 20% val
-EARLY_STOPPING_PATIENCE = 20
-EARLY_STOPPING_MIN_DELTA = 1e-3
+EARLY_STOPPING_PATIENCE = 12
+EARLY_STOPPING_MIN_DELTA = 5e-4
 
 TARGET_SIZE: Tuple[int, int] = (256, 256)
-ENCODER_NAME = "resnet34"
+# Use a stronger encoder backbone to improve feature extraction.
+# EfficientNet-B4 offers a good balance of accuracy and computational cost.
+ENCODER_NAME = "efficientnet-b4"
 ENCODER_WEIGHTS = "imagenet"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -62,6 +65,39 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
+
+
+def device_diagnostics(device: torch.device):
+    """
+    Explicit startup report: proves whether CUDA is usable, which GPU is selected,
+    and runs a tiny CUDA op to confirm actual GPU execution.
+    """
+    print("\n================ DEVICE DIAGNOSTICS ================")
+    print("Selected DEVICE:", device)
+    print("torch version:", torch.__version__)
+    print("torch.version.cuda:", torch.version.cuda)
+    print("CUDA available (torch.cuda.is_available):", torch.cuda.is_available())
+
+    if torch.cuda.is_available():
+        try:
+            n = torch.cuda.device_count()
+            print("CUDA device count:", n)
+            for i in range(n):
+                print(f"  GPU[{i}]:", torch.cuda.get_device_name(i))
+            print("Current CUDA device index:", torch.cuda.current_device())
+
+            # Proof-of-life: tiny op on GPU
+            x = torch.randn(512, 512, device="cuda")
+            y = (x @ x).mean()
+            torch.cuda.synchronize()
+            print("CUDA proof-of-life op: OK | result:", float(y))
+        except Exception as e:
+            print("CUDA reported available, but GPU test op failed:", repr(e))
+            print("This usually indicates a driver/runtime mismatch.")
+    else:
+        print("CUDA NOT available to PyTorch -> training will run on CPU.")
+        print("If nvidia-smi works, this usually means a CPU-only torch build is installed.")
+    print("====================================================\n")
 
 
 class EarlyStopping:
@@ -222,7 +258,7 @@ def build_model():
     model = MultiModalFPN(
         in_channels_sentinel=12,          # Sentinel-2 bands
         in_channels_landsat=16,           # Landsat + flag (even if zero in baseline)
-        in_channels_other_data=2,         # DEM + streets (concatenated)
+        in_channels_other_data=3,         # DEM + streets (concatenated)
         in_channels_era5_raster=2,        # as defined in model.py
         in_channels_era5_tabular=1,
         in_channels_ignition_map=1,
@@ -236,6 +272,9 @@ def build_model():
 
 def main():
     set_seed(42)
+
+    # GPU/CPU visibility at startup
+    device_diagnostics(DEVICE)
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(LOG_DIR_BASE, exist_ok=True)
@@ -255,6 +294,12 @@ def main():
     # Build model and move to device
     model = build_model().to(DEVICE)
 
+    # Confirm model actually sits on selected device
+    try:
+        print("Model device (first param):", next(model.parameters()).device)
+    except StopIteration:
+        print("Warning: model has no parameters? (unexpected)")
+
     # Optimizer & scheduler
     optimizer = optim.Adam(
         model.parameters(),
@@ -270,10 +315,10 @@ def main():
     landcover_loss_fn = nn.CrossEntropyLoss()  # unused baseline, kept for API
 
     # Early stopping on validation IoU (burned area)
-    early_stopping = EarlyStopping(
-        patience=EARLY_STOPPING_PATIENCE,
-        min_delta=EARLY_STOPPING_MIN_DELTA,
-    )
+    # early_stopping = EarlyStopping(
+    #     patience=EARLY_STOPPING_PATIENCE,
+    #     min_delta=EARLY_STOPPING_MIN_DELTA,
+    # )
 
     best_iou = -1.0
 
@@ -294,6 +339,7 @@ Experiment time: {current_time}
 - Scheduler: CosineAnnealingLR (T_max={NUM_EPOCHS}, eta_min=5e-5)
 - Epochs: {NUM_EPOCHS} with EarlyStopping(patience={EARLY_STOPPING_PATIENCE}, min_delta={EARLY_STOPPING_MIN_DELTA})
 - Batch size: {BATCH_SIZE}
+- Device: {DEVICE}
 """
     writer.add_text("Experiment/Notes", experiment_notes, global_step=0)
 
@@ -342,7 +388,7 @@ Experiment time: {current_time}
         # Checkpoint best model
         if val_iou_ba > best_iou:
             best_iou = val_iou_ba
-            checkpoint_path = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+            checkpoint_path = os.path.join(CHECKPOINT_DIR, model_name)
             torch.save(model.state_dict(), checkpoint_path)
             writer.add_text(
                 "Checkpoint",
@@ -352,14 +398,14 @@ Experiment time: {current_time}
             print(f"  >> New best model saved at {checkpoint_path} (IoU={best_iou:.4f})")
 
         # Early stopping
-        stop_training = early_stopping.step(val_iou_ba, epoch)
-        if stop_training:
-            print(f"\nEarly stopping triggered at epoch {epoch + 1}")
-            print(
-                f"Best validation IoU: {early_stopping.best_metric:.4f} "
-                f"(epoch {early_stopping.best_epoch + 1})"
-            )
-            break
+        # stop_training = early_stopping.step(val_iou_ba, epoch)
+        # if stop_training:
+        #     print(f"\nEarly stopping triggered at epoch {epoch + 1}")
+        #     print(
+        #         f"Best validation IoU: {early_stopping.best_metric:.4f} "
+        #         f"(epoch {early_stopping.best_epoch + 1})"
+        #     )
+        #     break
 
     writer.close()
     print("Training finished.")

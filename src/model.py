@@ -138,34 +138,23 @@ class AdvancedCrossModalFusionBlock(nn.Module):
 
 class MultiModalFPN(nn.Module):
     """
-    High-level multimodal model wrapper.
+    High-level multimodal model wrapper with multi-scale fusion.
 
-    Current baseline: Sentinel-only, but the signature and attributes
-    are kept compatible with the original multimodal design so that
-    additional modalities (Landsat, DEM, ERA5, ignition, etc.) can be
-    added later without touching the training code.
-
-    Forward signature (kept unchanged):
-
-        def forward(
-            self,
-            sentinel_image: torch.Tensor,
-            landsat_image: torch.Tensor,
-            dem_image: torch.Tensor,
-            ignition_map: torch.Tensor,
-            era5_raster: torch.Tensor,
-            era5_tabular,
-        )
-
-    Only `sentinel_image` is used in the baseline. The other arguments are
-    accepted for API compatibility and can be integrated later.
+    This class extends the Sentinel-only baseline by introducing learnable
+    projection layers for each additional modality (Landsat, other_data,
+    ERA5 raster and tabular) at every encoder scale. An
+    `AdvancedCrossModalFusionBlock` is applied at each scale to combine
+    the Sentinel features with projected auxiliary features. The fused
+    feature maps are then passed to the FPN decoder to produce burned
+    area and landcover predictions.  The forward signature is kept
+    compatible with the original design to support legacy training code.
     """
 
     def __init__(
         self,
         in_channels_sentinel: int = N_BANDS_SENTINEL,
         in_channels_landsat: int = N_BANDS_LANDSAT_WITH_FLAG,
-        in_channels_other_data: int = N_BANDS_DEM + N_BANDS_STREETS,
+        in_channels_other_data: int = N_BANDS_DEM + N_BANDS_STREETS + N_BANDS_IGNITION,
         in_channels_era5_raster: int = N_BANDS_ERA5_RASTER,
         in_channels_era5_tabular: int = N_BANDS_ERA5_TABULAR,
         in_channels_ignition_map: int = N_BANDS_IGNITION,
@@ -176,7 +165,8 @@ class MultiModalFPN(nn.Module):
     ):
         super().__init__()
 
-        # Core multi-task FPN using Sentinel bands as input
+        # Base multi-task FPN using Sentinel bands as input.  This handles
+        # the encoder/decoder architecture and the segmentation heads.
         self.base_fpn = MultiTaskFPN(
             encoder_name=encoder_name,
             encoder_weights=encoder_weights,
@@ -185,13 +175,13 @@ class MultiModalFPN(nn.Module):
             landcover_classes=landcover_classes,
         )
 
-        # Expose commonly used attributes to preserve compatibility
+        # Expose encoder/decoder and heads for reuse
         self.encoder = self.base_fpn.encoder
         self.decoder = self.base_fpn.decoder
         self.ba_segmentation_head = self.base_fpn.burned_area_head
         self.lc_segmentation_head = self.base_fpn.landcover_head
 
-        # Store channel configs for future multimodal encoders (not used in baseline)
+        # Store channel configs for each modality
         self.in_channels_sentinel = in_channels_sentinel
         self.in_channels_landsat = in_channels_landsat
         self.in_channels_other_data = in_channels_other_data
@@ -199,28 +189,108 @@ class MultiModalFPN(nn.Module):
         self.in_channels_era5_tabular = in_channels_era5_tabular
         self.in_channels_ignition_map = in_channels_ignition_map
 
+        # Determine channel dimensions of encoder outputs.  This list
+        # corresponds to the number of channels at each scale of the
+        # Sentinel encoder (e.g. [64, 256, 512, ...]).  We will fuse
+        # modalities at every scale.
+        sentinel_channels = list(self.encoder.out_channels)
+
+        # Projection layers for Landsat (shared across scales)
+        self.landsat_proj = nn.ModuleList(
+            [nn.Conv2d(self.in_channels_landsat, c, kernel_size=1) for c in sentinel_channels]
+        )
+
+        # Projection layers for other_data (DEM + streets + ignition)
+        self.other_proj = nn.ModuleList(
+            [nn.Conv2d(self.in_channels_other_data, c, kernel_size=1) for c in sentinel_channels]
+        )
+
+        # Projection layers for ERA5 raster
+        self.era5_raster_proj = nn.ModuleList(
+            [nn.Conv2d(self.in_channels_era5_raster, c, kernel_size=1) for c in sentinel_channels]
+        )
+
+        # Projection layers for ERA5 tabular (a scalar per sample)
+        self.era5_tabular_proj = nn.ModuleList(
+            [nn.Linear(self.in_channels_era5_tabular, c) for c in sentinel_channels]
+        )
+
+        # Fusion blocks: one per scale.  Each block fuses the Sentinel
+        # feature map with the projected Landsat, other_data, ERA5 raster and
+        # ERA5 tabular features.  The output channels equal the Sentinel
+        # feature channels at that scale.
+        self.fusion_blocks = nn.ModuleList(
+            [
+                AdvancedCrossModalFusionBlock(
+                    channel_dims=[c] * 5,  # 5 modalities: Sentinel, Landsat, Other, ERA5 raster, ERA5 tabular
+                    output_channels=c,
+                )
+                for c in sentinel_channels
+            ]
+        )
+
     def forward(
         self,
         sentinel_image: torch.Tensor,
         landsat_image: torch.Tensor,
-        dem_image: torch.Tensor,
+        other_data: torch.Tensor,
         ignition_map: torch.Tensor,
         era5_raster: torch.Tensor,
-        era5_tabular,
+        era5_tabular: torch.Tensor,
     ):
         """
-        Baseline forward: only Sentinel is used.
+        Perform forward pass with multi-scale multimodal fusion.
 
         Args:
-            sentinel_image: (B, C_sentinel, H, W)
-            landsat_image: unused (kept for compatibility)
-            dem_image: unused
-            ignition_map: unused
-            era5_raster: unused
-            era5_tabular: unused
+            sentinel_image: Tensor of shape (B, C_sentinel, H, W)
+            landsat_image: Tensor of shape (B, C_landsat, H, W)
+            other_data: Tensor of shape (B, C_other_data, H, W)
+            ignition_map: Unused (kept for compatibility with legacy API)
+            era5_raster: Tensor of shape (B, C_era5_raster, H, W)
+            era5_tabular: Tensor of shape (B, C_era5_tabular)
 
         Returns:
-            burned_area_mask, landcover_mask
+            burned_area_mask: (B, num_classes, H, W)
+            landcover_mask: (B, landcover_classes, H, W)
         """
-        burned_area_mask, landcover_mask = self.base_fpn(sentinel_image)
+        # Extract Sentinel encoder features at multiple scales
+        sentinel_features = self.encoder(sentinel_image)
+
+        fused_features = []
+        # Iterate over each scale and fuse modalities
+        for idx, feat in enumerate(sentinel_features):
+            # Determine spatial resolution for this scale
+            h, w = feat.shape[2], feat.shape[3]
+
+            # Project Landsat and downsample to match this scale
+            landsat_proj = self.landsat_proj[idx](landsat_image)
+            landsat_feat = torch.nn.functional.adaptive_avg_pool2d(landsat_proj, (h, w))
+
+            # Project other_data (DEM + streets + ignition) and downsample
+            other_proj = self.other_proj[idx](other_data)
+            other_feat = torch.nn.functional.adaptive_avg_pool2d(other_proj, (h, w))
+
+            # Project ERA5 raster and downsample
+            era5_proj = self.era5_raster_proj[idx](era5_raster)
+            era5_feat = torch.nn.functional.adaptive_avg_pool2d(era5_proj, (h, w))
+
+            # Project ERA5 tabular (scalar per sample) and broadcast spatially
+            tab_proj = self.era5_tabular_proj[idx](era5_tabular)
+            tab_feat = tab_proj.unsqueeze(-1).unsqueeze(-1)
+            tab_feat = tab_feat.expand(-1, -1, h, w)
+
+            # Fuse all modalities at this scale
+            fused = self.fusion_blocks[idx]([
+                feat,
+                landsat_feat,
+                other_feat,
+                era5_feat,
+                tab_feat,
+            ])
+            fused_features.append(fused)
+
+        # Decode fused features with FPN decoder
+        decoder_output = self.decoder(fused_features)
+        burned_area_mask = self.ba_segmentation_head(decoder_output)
+        landcover_mask = self.lc_segmentation_head(decoder_output)
         return burned_area_mask, landcover_mask
