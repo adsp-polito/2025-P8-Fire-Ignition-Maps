@@ -1,0 +1,7 @@
+geojson_path: data/shp_cp_2012_2024/piedmont_2012_2024_fa.geojson
+image_similarity_tolerance: 0.005
+interval_pre_fire_days: 7
+min_fire_area_sq_m: 200
+patch_size_pixels: 256
+satellite: Landsat
+target_crs: EPSG:32632

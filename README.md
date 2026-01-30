@@ -32,27 +32,33 @@ The primary goals of this research are:
 
 ---
 
-## 🧠 Methodology Overview
+## Methodology
 
-This project contrasts two modeling approaches to isolate the value of data fusion.
+### Model Architecture
 
-### 1. Baseline Model
-- **Architecture:** U-Net / FPN-style segmentation
-- **Input:** Sentinel-2 imagery only (12 spectral bands)
-- **Encoder:** **ResNet-34** (ImageNet pretrained)
-- **Purpose:** Provide a strong, interpretable reference baseline.
+The proposed architecture follows a **feature-level multimodal fusion strategy** designed to preserve high-resolution spatial detail while incorporating complementary environmental context.
 
-### 2. Multimodal Model (Final Proposed Solution)
-- **Architecture:** MultiModalFPN
-- **Inputs:**
-  - 🛰️ Sentinel-2 imagery
-  - 🛰️ Landsat imagery
-  - 🏔️ DEM + Road network rasters
-  - ☁️ ERA5 Weather (Raster + Tabular)
-  - 🔥 Ignition point map
-- **Encoder:** **EfficientNet-B4** (ImageNet pretrained)
-- **Fusion:** Attention-based feature fusion blocks
-- **Purpose:** Leverage complementary pre-fire signals to improve segmentation accuracy.
+- **Primary backbone:** Sentinel-2 imagery encoded using **EfficientNet-B4**
+- **Auxiliary inputs:**  
+  - Landsat-8 imagery  
+  - Digital Elevation Model (DEM)  
+  - Road / human infrastructure density maps  
+  - ERA5 meteorological variables (temperature, wind)
+- **Fusion strategy:** Auxiliary modalities are projected and fused at **multiple encoder scales**
+- **Decoder:** Feature Pyramid Network (FPN)
+- **Outputs:**
+  - Main head: burned-area probability map  
+  - Auxiliary head: land-cover classification (training only)
+
+The auxiliary task improves spatial coherence and reduces physically implausible predictions.
+
+---
+
+### Architecture Diagram
+
+<p align="center">
+  <img src="documents/model_architecture.png" width="800"/>
+</p>
 
 ---
 
@@ -114,54 +120,37 @@ This project shows that:
 ## 🗂️ Project Structure
 
 ```text
-WildFire/
+├── data/
+│   └── geojson/
 │
-├── data/                       # Raw and processed datasets
-├── geojson/                    # Vector data
-│
-├── docs/                       # Documentation & Analysis
-│   ├── Maps_Graphs/            # Generated inference maps
-│   ├── modality_ablation/      # Ablation study results
-│   ├── model_comparison/       # Baseline vs Multimodal metrics
-│   ├── slide_figures/          # Figures for presentation
+├── documents/
+│   ├── model_architecture.png
+│   ├── inference_checkpoint_3_results/
+│   ├── Maps_Graphs_checkpoint_1/
+│   ├── modality_ablation_checkpoint_3/
+│   ├── model_comparison_baseline_multimodal_checkpoint_3/
+│   ├── multimodal_auxiliary_final_checkpoint/
 │   └── output_result_paper_comparison.txt
 │
-├── inference/                  # Inference Scripts
-│   ├── compare_baseline_vs_multimodal.py
-│   ├── deploy_inference.py
-│   ├── inference_2.py
-│   └── inference_map.py
+├── inference/
 │
-├── src/                        # Source Code
-│   ├── Baseline_model/         # Baseline Implementation
-│   │   ├── dataset.py
-│   │   ├── augmentations.py
-│   │   ├── train.py
-│   │   ├── main.py
-│   │   └── unet_sentinel_best.pth
-│   │
-│   ├── checkpoint_2/           # Saved Models
-│   │   └── best_model_3.pth
-│   │
-│   ├── figures_tables/         # Visualization Scripts
-│   │   ├── export_slide_table.py
-│   │   ├── make_qualitative_panels.py
-│   │   ├── modality_ablation_quick.py
-│   │   ├── paper_comparison.py
-│   │   └── plot_threshold_sweep.py
-│   │
-│   ├── dataset.py
-│   ├── model.py
-│   ├── train.py
-│   ├── utils.py
-│   └── main.py                 # Main Training Entry Point
+├── report/
+│   ├── Checkpoint_1/
+│   ├── Checkpoint_2/
+│   ├── Checkpoint_3/
+│   ├── checkpoint_final/
+│   └── paper_final/
 │
-├── inference_output/
-├── runs/                       # TensorBoard Logs
+├── src/
+│   ├── baseline_singlemodal/
+│   ├── multimodal/
+│   ├── multimodal_auxiliary/
+│   ├── preprocess_download_data/
+│   ├── inference_output/
+│   └── figures_tables/
 │
-├── .gitignore
-├── .gitattributes
-└── readme.md
+├── requirements.txt
+├── README.md
 
 
 
