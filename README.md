@@ -57,7 +57,7 @@ The auxiliary task improves spatial coherence and reduces physically implausible
 ### Architecture Diagram
 
 <p align="center">
-  <img src="documents/model_architecture.png" width="800"/>
+  <img src="Documents/model_architecture.png" width="800"/>
 </p>
 
 ---
