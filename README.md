@@ -112,8 +112,10 @@ This project shows that:
 
 ## 👤 Authors
 
-**Yousef Fayyaz**
-**Parastoo Hashemi Alvar**
+- **Yousef Fayyaz** (Student ID: s341999)  
+- **Parastoo Hashemi Alvar** (Student ID: s339438)  
+
+GitHub repository: https://github.com/josephfayyaz/WildFire
 
 ---
 
