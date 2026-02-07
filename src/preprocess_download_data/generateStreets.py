@@ -6,59 +6,67 @@ import numpy as np
 import os
 import re
 
-# --- Configurazione Globale UNICA (MODIFICA QUESTO PERCORSO) ---
-GLOBAL_ROADS_GEOJSON_PATH = "data/strade.geojson" # <-- MODIFICA QUESTO CON IL TUO PERCORSO REALE!
+# --- Single Global Configuration (EDIT THIS PATH) ---
+GLOBAL_ROADS_GEOJSON_PATH = "data/strade.geojson"  # <-- UPDATE THIS TO YOUR REAL PATH!
 
-# CRS target per tutte le operazioni spaziali (il tuo EPSG:32632)
+# Target CRS for all spatial operations (your EPSG:32632)
 TARGET_CRS = "EPSG:32632"
 
-# Carica e riproietta il GeoJSON delle strade una sola volta all'inizio dello script
-strade_gdf = None # Inizializza a None, verrà caricato se il percorso è valido
+# Load and reproject the roads GeoJSON once at the start of the script
+strade_gdf = None  # Initialize as None; will be loaded if the path is valid
 try:
     if os.path.exists(GLOBAL_ROADS_GEOJSON_PATH):
-        print(f"Caricamento e riproiezione di {GLOBAL_ROADS_GEOJSON_PATH} a {TARGET_CRS}...")
+        print(f"Loading and reprojecting {GLOBAL_ROADS_GEOJSON_PATH} to {TARGET_CRS}...")
         strade_gdf = gpd.read_file(GLOBAL_ROADS_GEOJSON_PATH)
         strade_gdf = strade_gdf.to_crs(TARGET_CRS)
-        # Crea un indice spaziale per query veloci (essenziale per grandi dataset)
+        # Create a spatial index for fast queries (essential for large datasets)
         strade_gdf.sindex
-        print("Strade GeoDataFrame caricato e riproiettato con successo e indice creato.")
+        print("Roads GeoDataFrame loaded and reprojected successfully, and spatial index created.")
     else:
-        print(f"Errore: Il file strade.geojson non trovato al percorso: {GLOBAL_ROADS_GEOJSON_PATH}")
-        print("Assicurati che 'GLOBAL_ROADS_GEOJSON_PATH' sia impostato correttamente.")
+        print(f"Error: roads.geojson file not found at path: {GLOBAL_ROADS_GEOJSON_PATH}")
+        print("Make sure 'GLOBAL_ROADS_GEOJSON_PATH' is set correctly.")
 except Exception as e:
-    print(f"Errore durante il caricamento o riproiezione del GeoJSON delle strade: {e}")
+    print(f"Error while loading or reprojecting the roads GeoJSON: {e}")
     strade_gdf = None
+
 
 def generate_streets_raster_for_fire_folder(fire_folder_path: str):
     """
-    Genera un raster delle strade (fire_id_streets.tif) per una data cartella di incendio.
+    Generates a roads raster (fire_id_streets.tif) for a given fire folder.
 
     Args:
-        fire_folder_path (str): Il percorso completo alla cartella di un singolo incendio (es. 'data/fire_5411').
+        fire_folder_path (str): Full path to a single fire folder (e.g., 'data/fire_5411').
     """
     if strade_gdf is None:
-        print(f"  Impossibile elaborare '{os.path.basename(fire_folder_path)}': il GeoJSON delle strade non è stato caricato correttamente o non trovato.")
+        print(
+            f"  Cannot process '{os.path.basename(fire_folder_path)}': "
+            f"roads GeoJSON was not loaded correctly or not found."
+        )
         return
 
-    # Estrai il fire_ID dal nome della cartella
+    # Extract fire_ID from folder name
     fire_id = os.path.basename(fire_folder_path)
-    print(f"\nElaborazione dell'incendio: {fire_id}")
+    print(f"\nProcessing fire: {fire_id}")
 
-    # --- 1. Trova un'immagine Sentinel di riferimento nella cartella ---
-    # Qualsiasi file Sentinel .tif che non sia una maschera va bene per ottenere i riferimenti spaziali.
+    # --- 1. Find a reference Sentinel image inside the folder ---
+    # Any Sentinel .tif that is not a mask is fine to obtain spatial references.
     sentinel_ref_path = None
     for fname in os.listdir(fire_folder_path):
-        if "sentinel" in fname.lower() and fname.lower().endswith(".tif") and "_gt" not in fname.lower() and "_cm" not in fname.lower() and "_temp" not in fname.lower():
+        if ("sentinel" in fname.lower()
+                and fname.lower().endswith(".tif")
+                and "_gt" not in fname.lower()
+                and "_cm" not in fname.lower()
+                and "_temp" not in fname.lower()):
             sentinel_ref_path = os.path.join(fire_folder_path, fname)
             break
-    
+
     if sentinel_ref_path is None:
-        print(f"  Errore: Nessun file Sentinel .tif di riferimento trovato nella cartella '{fire_folder_path}'. Skipping.")
+        print(f"  Error: No reference Sentinel .tif found in folder '{fire_folder_path}'. Skipping.")
         return
 
-    print(f"  Trovata immagine di riferimento Sentinel: {os.path.basename(sentinel_ref_path)}")
+    print(f"  Found reference Sentinel image: {os.path.basename(sentinel_ref_path)}")
 
-    # --- 2. Ottieni le proprietà spaziali dall'immagine Sentinel ---
+    # --- 2. Read spatial properties from the Sentinel image ---
     try:
         with rasterio.open(sentinel_ref_path) as src:
             img_bounds = src.bounds
@@ -66,85 +74,95 @@ def generate_streets_raster_for_fire_folder(fire_folder_path: str):
             img_width = src.width
             img_height = src.height
             img_crs = src.crs
-            print(f"  Dimensioni immagine di riferimento: {img_width}x{img_height} pixel")
-            print(f"  CRS immagine di riferimento: {img_crs}")
+            print(f"  Reference image dimensions: {img_width}x{img_height} pixels")
+            print(f"  Reference image CRS: {img_crs}")
 
             if str(img_crs) != TARGET_CRS:
-                print(f"  Attenzione: Il CRS dell'immagine Sentinel ({img_crs}) non corrisponde al CRS target ({TARGET_CRS}).")
-                print("  Assicurati che tutte le immagini e i dati spaziali siano nel CRS corretto per un allineamento preciso.")
+                print(
+                    f"  Warning: Sentinel CRS ({img_crs}) does not match target CRS ({TARGET_CRS})."
+                )
+                print(
+                    "  Ensure all images and spatial data use the correct CRS for precise alignment."
+                )
 
     except Exception as e:
-        print(f"  Errore durante l'apertura o lettura delle proprietà dell'immagine di riferimento: {e}. Skipping.")
+        print(f"  Error opening/reading reference image properties: {e}. Skipping.")
         return
 
-    # --- 3. Filtra le strade che intersecano la bounding box dell'immagine ---
+    # --- 3. Filter roads intersecting the image bounding box ---
     bbox_polygon = Polygon([
         (img_bounds.left, img_bounds.bottom),
         (img_bounds.left, img_bounds.top),
         (img_bounds.right, img_bounds.top),
         (img_bounds.right, img_bounds.bottom)
     ])
-    
-    # Usa l'indice spaziale per una query efficiente
-    possible_matches_index = list(strade_gdf.sindex.intersection(bbox_polygon.bounds))
-    filtered_strade = strade_gdf.iloc[possible_matches_index].cx[img_bounds.left:img_bounds.right, img_bounds.bottom:img_bounds.top]
-    
-    print(f"  Trovate {len(filtered_strade)} geometrie stradali che intersecano l'area dell'immagine.")
 
-    # --- 4. Rasterizzazione delle Strade ---
+    # Use spatial index for efficient querying
+    possible_matches_index = list(strade_gdf.sindex.intersection(bbox_polygon.bounds))
+    filtered_strade = strade_gdf.iloc[possible_matches_index].cx[
+        img_bounds.left:img_bounds.right, img_bounds.bottom:img_bounds.top
+    ]
+
+    print(f"  Found {len(filtered_strade)} road geometries intersecting the image area.")
+
+    # --- 4. Rasterize roads ---
     if filtered_strade.empty:
-        print(f"  Nessuna strada valida trovata nell'area dell'immagine per {fire_id}.")
+        print(f"  No valid roads found in the image area for {fire_id}.")
         roads_raster = np.zeros((img_height, img_width), dtype=np.uint8)
     else:
-        # Prepara le geometrie con i valori GP_RTP da rasterizzare
-        shapes_to_rasterize = [(row.geometry, row['GP_RTP']) for idx, row in filtered_strade.iterrows()]
+        # Prepare geometries with GP_RTP values to rasterize
+        shapes_to_rasterize = [(row.geometry, row["GP_RTP"]) for idx, row in filtered_strade.iterrows()]
 
         roads_raster = rasterize(
             shapes=shapes_to_rasterize,
             out_shape=(img_height, img_width),
             transform=img_transform,
-            all_touched=True, # Cattura tutti i pixel toccati dalle geometrie
-            fill=0, # Valore di background per i pixel senza strade
-            dtype=np.uint8 # Tipo di dato per il raster (0 per background, 1-5 per GP_RTP)
+            all_touched=True,  # Capture all pixels touched by geometries
+            fill=0,            # Background value for pixels without roads
+            dtype=np.uint8     # Data type (0 for background, 1-5 for GP_RTP)
         )
-    
-    # --- 5. Salvataggio del Raster TIFF ---
+
+    # --- 5. Save the TIFF raster ---
     output_tif_path = os.path.join(fire_folder_path, f"{fire_id}_streets.tif")
 
     try:
         with rasterio.open(
             output_tif_path,
-            'w',
-            driver='GTiff',
+            "w",
+            driver="GTiff",
             height=img_height,
             width=img_width,
-            count=1, # Una singola banda per il tipo di strada
+            count=1,  # Single band for road type
             dtype=roads_raster.dtype,
-            crs=img_crs, # Usa il CRS dell'immagine di riferimento
-            transform=img_transform, # Usa la trasformazione dell'immagine di riferimento
+            crs=img_crs,            # Use reference image CRS
+            transform=img_transform # Use reference image transform
         ) as dst:
-            dst.write(roads_raster, 1) # Scrivi la banda 1 (il nostro array roads_raster)
-        print(f"  Raster TIFF '{os.path.basename(output_tif_path)}' generato e salvato con successo.")
+            dst.write(roads_raster, 1)  # Write band 1 (roads_raster)
+        print(f"  TIFF raster '{os.path.basename(output_tif_path)}' generated and saved successfully.")
     except Exception as e:
-        print(f"  Errore durante il salvataggio del raster TIFF delle strade: {e}. Il file potrebbe non essere stato creato.")
-        # Non si esce con return qui, l'errore è stampato ma il loop può continuare per altri folder
+        print(
+            f"  Error while saving roads TIFF raster: {e}. "
+            f"The file may not have been created."
+        )
+        # Do not return here; allow loop to continue for other folders
 
-# --- Blocco per il processing di TUTTI i folder "fire_*" ---
+
+# --- Block to process ALL "fire_*" folders ---
 if __name__ == "__main__":
-    # --- 1. IMPOSTA QUI IL PERCORSO ALLA DIRECTORY PRINCIPALE DEI TUOI DATI ---
-    main_data_root = "piedmont_new" # <-- MODIFICA QUESTO!
+    # --- 1. SET THE PATH TO YOUR MAIN DATA DIRECTORY HERE ---
+    main_data_root = "piedmont_new"  # <-- UPDATE THIS!
 
     if os.path.exists(main_data_root):
-        print(f"Avvio elaborazione dei raster delle strade per tutti i folder in: {main_data_root}")
+        print(f"Starting roads raster processing for all folders in: {main_data_root}")
         processed_count = 0
         for item in os.listdir(main_data_root):
             full_path = os.path.join(main_data_root, item)
-            # Processa solo le sottocartelle che iniziano con "fire_"
+            # Process only subfolders starting with "fire_"
             if os.path.isdir(full_path) and item.startswith("fire_"):
                 generate_streets_raster_for_fire_folder(full_path)
                 processed_count += 1
-        print(f"\nElaborazione completata. Generati raster per {processed_count} cartelle di incendio.")
+        print(f"\nProcessing completed. Generated rasters for {processed_count} fire folders.")
     else:
-        print(f"Errore: La directory principale '{main_data_root}' non esiste. Controlla il percorso.")
+        print(f"Error: Main directory '{main_data_root}' does not exist. Check the path.")
 
-    print("\nScript terminato.")
+    print("\nScript finished.")

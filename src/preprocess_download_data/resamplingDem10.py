@@ -3,103 +3,126 @@ import rasterio
 import numpy as np
 import cv2
 from rasterio.warp import Resampling
-# Assicurati che il percorso sia corretto per le tue funzioni utils
+# Make sure the path is correct for your utils functions
 from modelWithLandsat.utils import resample_image, read_image_and_metadata
 
-# --- Configurazione Generale ---
-BASE_DATA_DIR = 'piedmont_new' 
+# --- General Configuration ---
+BASE_DATA_DIR = "piedmont_new"
 
-# Suffisso da aggiungere ai nomi dei file dem risampled.
+# Suffix to append to resampled DEM filenames.
+RESAMPLED_SUFFIX = "_10m.tif"
 
-RESAMPLED_SUFFIX = '_10m.tif'
 
-def find_images_by_criteria(directory, file_type='sentinel'):
+def find_images_by_criteria(directory, file_type="sentinel"):
     """
-    Trova i file immagine basandosi su criteri specifici.
+    Finds image files based on specific criteria.
+
     Args:
-        directory (str): Il percorso della directory in cui cercare.
-        file_type (str): 'sentinel' per pre_sentinel.tif (non CM), 'dem' per pre_dem.tif (non CM, non risampled).
+        directory (str): Directory path to search in.
+        file_type (str): 'sentinel' for pre_sentinel.tif (non-CM),
+                         'dem' for dem.tif (non-CM, not already resampled).
+
     Returns:
-        list: Una lista di percorsi completi dei file trovati.
+        list: A list of full paths for the files found.
     """
     found_files = []
     for root, _, files in os.walk(directory):
         for f in files:
-            if file_type == 'sentinel':
-                # Criteri per Sentinel: contiene "pre_sentinel", termina con ".tif", NON contiene "_CM", NON contiene il suffisso di resampling
+            if file_type == "sentinel":
+                # Sentinel criteria: contains "pre_sentinel", ends with ".tif",
+                # does NOT contain "_CM", does NOT contain the resampling suffix
                 if "pre_sentinel" in f and f.endswith(".tif") and "_CM" not in f and RESAMPLED_SUFFIX not in f:
                     found_files.append(os.path.join(root, f))
-                    # Per Sentinel, ne vogliamo solo una come riferimento, quindi possiamo fermarci al primo match
-                    return found_files 
-            elif file_type == 'dem':
-                # Criteri per dem: contiene "dem", termina con ".tif", NON contiene "_CM", NON contiene il suffisso di resampling
+                    # For Sentinel we only need one reference, so we can stop at the first match
+                    return found_files
+
+            elif file_type == "dem":
+                # DEM criteria: contains "dem", ends with ".tif",
+                # does NOT contain "_CM", does NOT contain the resampling suffix
                 if "dem" in f and f.endswith(".tif") and RESAMPLED_SUFFIX not in f:
                     found_files.append(os.path.join(root, f))
+
     return found_files
+
 
 def process_fire_folder(fire_dir_path):
     """
-    Processa una singola cartella di fuoco: trova Sentinel e tutte le dem,
-    e risample ogni dem a Sentinel.
+    Processes a single fire folder: finds the Sentinel reference and all DEMs,
+    then resamples each DEM to match the Sentinel grid.
     """
     print(f"\nProcessing folder: {fire_dir_path}")
 
-    # Trova il percorso dell'immagine Sentinel di riferimento (ne prendiamo solo una)
-    sentinel_paths = find_images_by_criteria(fire_dir_path, file_type='sentinel')
+    # Find the Sentinel reference image path (we take only one)
+    sentinel_paths = find_images_by_criteria(fire_dir_path, file_type="sentinel")
     if not sentinel_paths:
-        print(f"  ATTENZIONE: Nessun file 'pre_sentinel' (non CM) trovato in {fire_dir_path}. Salto questa cartella.")
+        print(
+            f"  WARNING: No 'pre_sentinel' file (non-CM) found in {fire_dir_path}. "
+            f"Skipping this folder."
+        )
         return
-    
-    # Prendi la prima Sentinel trovata come riferimento per i metadati
+
+    # Use the first Sentinel found as reference for metadata
     sentinel_reference_path = sentinel_paths[0]
 
-    # Trova tutti i percorsi delle immagini dem originali
-    dem_paths = find_images_by_criteria(fire_dir_path, file_type='dem')
+    # Find all original DEM image paths
+    dem_paths = find_images_by_criteria(fire_dir_path, file_type="dem")
     if not dem_paths:
-        print(f"  ATTENZIONE: Nessun file 'dem' (non CM, non risampled) trovato in {fire_dir_path}. Salto questa cartella o non eseguo il resampling dem.")
+        print(
+            f"  WARNING: No 'dem' file (non-CM, not resampled) found in {fire_dir_path}. "
+            f"Skipping this folder or not resampling DEM."
+        )
         return
 
     try:
-        # Carica i metadati di Sentinel (il nostro riferimento a 10m)
-        _, sentinel_transform, sentinel_crs, sentinel_shape, sentinel_res, _ = read_image_and_metadata(sentinel_reference_path)
-        print(f"  Sentinel reference: shape={sentinel_shape}, res={sentinel_res}m, path={os.path.basename(sentinel_reference_path)}")
+        # Load Sentinel metadata (our 10 m reference)
+        _, sentinel_transform, sentinel_crs, sentinel_shape, sentinel_res, _ = read_image_and_metadata(
+            sentinel_reference_path
+        )
+        print(
+            f"  Sentinel reference: shape={sentinel_shape}, res={sentinel_res}m, "
+            f"path={os.path.basename(sentinel_reference_path)}"
+        )
 
-        # Processa ogni immagine dem trovata
+        # Process each DEM found
         for dem_path in dem_paths:
             original_dem_filename = os.path.basename(dem_path)
-            dem_output_filename = original_dem_filename.replace('.tif', RESAMPLED_SUFFIX)
+            dem_output_filename = original_dem_filename.replace(".tif", RESAMPLED_SUFFIX)
             output_dem_10m_path = os.path.join(os.path.dirname(dem_path), dem_output_filename)
 
-            # Controlla se il file risampled esiste già per evitare di rifare il lavoro
+            # Skip if already resampled
             if os.path.exists(output_dem_10m_path):
-                print(f"  File dem risampled '{os.path.basename(output_dem_10m_path)}' esiste già. Salto il resampling per questo file.")
-                continue # Passa al prossimo file dem
+                print(
+                    f"  Resampled DEM file '{os.path.basename(output_dem_10m_path)}' already exists. "
+                    f"Skipping resampling for this file."
+                )
+                continue
 
-            # Carica i metadati di dem (l'immagine da risample)
+            # Load DEM metadata (image to resample)
             _, dem_transform, dem_crs, dem_shape, dem_res, _ = read_image_and_metadata(dem_path)
-            print(f" Dem original: shape={dem_shape}, res={dem_res}m, path={original_dem_filename}")
+            print(f"  DEM original: shape={dem_shape}, res={dem_res}m, path={original_dem_filename}")
 
-            # Esegui l'UPsampling di dem a 10m
-            print(f"  Eseguo l'UPsampling di dem a 10m per {original_dem_filename} -> {dem_output_filename}")
+            # Upsample DEM to 10 m
+            print(f"  Upsampling DEM to 10 m: {original_dem_filename} -> {dem_output_filename}")
             resample_image(
                 input_tif_path=dem_path,
                 output_tif_path=output_dem_10m_path,
                 target_transform=sentinel_transform,
                 target_crs=sentinel_crs,
-                target_shape=sentinel_shape # Passa (Height, Width)
+                target_shape=sentinel_shape  # (Height, Width)
             )
-            print(f"  dem risampled salvato in: {output_dem_10m_path}")
+            print(f"  Resampled DEM saved to: {output_dem_10m_path}")
 
     except Exception as e:
-        print(f"  Errore durante il processamento della cartella {fire_dir_path}: {e}")
+        print(f"  Error while processing folder {fire_dir_path}: {e}")
+
 
 # --- Main Execution ---
-print(f"Inizio il processo di pre-resampling per le cartelle in '{BASE_DATA_DIR}'...")
+print(f"Starting pre-resampling process for folders in '{BASE_DATA_DIR}'...")
 
-# Itera su tutte le sottocartelle in BASE_DATA_DIR
+# Iterate through all subfolders in BASE_DATA_DIR
 for item_name in os.listdir(BASE_DATA_DIR):
     full_path = os.path.join(BASE_DATA_DIR, item_name)
-    if os.path.isdir(full_path) and item_name.startswith('fire_'): # Filtra solo le cartelle "fire_"
+    if os.path.isdir(full_path) and item_name.startswith("fire_"):  # Only "fire_" folders
         process_fire_folder(full_path)
 
-print("\nProcesso di pre-resampling completato per tutte le cartelle dei fuochi.")
+print("\nPre-resampling process completed for all fire folders.")
