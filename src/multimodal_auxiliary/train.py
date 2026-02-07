@@ -19,6 +19,7 @@ def dice_loss(logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-6)
     return 1.0 - dice.mean()
 
 
+
 def _landcover_targets_from_input(landcover_input: torch.Tensor) -> torch.Tensor:
     """Convert landcover input tensor to class-index targets [B,H,W] (long)."""
     lc = landcover_input
