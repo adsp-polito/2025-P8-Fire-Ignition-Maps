@@ -5,7 +5,6 @@ from utils import fast_hist, fire_area_iou
 # ---- Gradient Accumulation Control ----
 ACCUM_STEPS = 8  # effective_batch = BATCH_SIZE * ACCUM_STEPS
 
-
 def dice_loss(logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
     """Dice loss for binary segmentation (burned / not burned)."""
     if targets.dim() == 3:
